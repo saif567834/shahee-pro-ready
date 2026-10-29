@@ -33,10 +33,85 @@ app.post('/api/orders',limit(15,36e5),wrap(async(q,s)=>{const b=q.body,c={name:c
   if(method==='online'&&RZP){const z=await fetch('https://api.razorpay.com/v1/orders',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Basic '+Buffer.from(E.RAZORPAY_KEY_ID+':'+E.RAZORPAY_KEY_SECRET).toString('base64')},body:JSON.stringify({amount:total*100,currency:'INR',receipt:'order_'+o.id})});
     const j=await z.json();if(!z.ok)throw bad('Payment provider error',502);await D.patch('orders',o.id,{rzp_order:j.id});out.rzp={key:E.RAZORPAY_KEY_ID,order_id:j.id,amount:total*100}}
   s.json(out)}));
-app.post('/api/payments/verify',wrap(async(q,s)=>{const{order_id,razorpay_order_id,razorpay_payment_id,razorpay_signature}=q.body;if(!RZP)throw bad('Online payments not enabled');
-  const o=await D.get('orders',+order_id),good=crypto.createHmac('sha256',E.RAZORPAY_KEY_SECRET).update(razorpay_order_id+'|'+razorpay_payment_id).digest('hex');
-  if(!o||o.rzp_order!==razorpay_order_id||!eq(good,razorpay_signature||''))throw bad('Verification failed');
-  await D.patch('orders',o.id,{pay_status:'paid',rzp_payment:razorpay_payment_id});s.json({ok:true})}));
+app.post('/api/payments/verify', wrap(async (q, s) => {
+  const {
+    order_id,
+    razorpay_order_id,
+    razorpay_payment_id,
+    razorpay_signature
+  } = q.body;
+
+  if (!RZP) throw bad('Online payments not enabled', 503);
+
+  const o = await D.get('orders', Number(order_id));
+
+  if (!o || !o.rzp_order ||
+      o.rzp_order !== razorpay_order_id ||
+      !razorpay_payment_id || !razorpay_signature) {
+    throw bad('Invalid order or missing payment details', 400);
+  }
+
+  // Verify the Razorpay Checkout signature.
+  const expected = crypto
+    .createHmac('sha256', E.RAZORPAY_KEY_SECRET)
+    .update(`${o.rzp_order}|${razorpay_payment_id}`)
+    .digest('hex');
+
+  if (!eq(expected, razorpay_signature)) {
+    throw bad('Payment signature verification failed', 400);
+  }
+
+  // Retrieve the actual payment status from Razorpay.
+  const response = await fetch(
+    `https://api.razorpay.com/v1/payments/${encodeURIComponent(razorpay_payment_id)}`,
+    {
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(
+          `${E.RAZORPAY_KEY_ID}:${E.RAZORPAY_KEY_SECRET}`
+        ).toString('base64')
+      }
+    }
+  );
+
+  if (!response.ok) {
+    console.error('Razorpay payment lookup failed:', response.status);
+    throw bad('Unable to confirm payment status. Please retry.', 502);
+  }
+
+  const payment = await response.json();
+
+  // Confirm payment belongs to this order and matches the expected amount.
+  if (
+    payment.id !== razorpay_payment_id ||
+    payment.order_id !== o.rzp_order ||
+    payment.amount !== o.total * 100 ||
+    payment.currency !== 'INR'
+  ) {
+    throw bad('Payment details do not match this order', 400);
+  }
+
+  if (payment.status !== 'captured') {
+    return s.status(409).json({
+      ok: false,
+      verified: false,
+      status: payment.status,
+      message: 'Payment is not captured yet. Please retry verification.'
+    });
+  }
+
+  // Do not let a repeat request overwrite a different payment.
+  if (o.pay_status === 'paid' &&
+      o.rzp_payment !== razorpay_payment_id) {
+    throw bad('This order is already linked to another payment', 409);
+  }
+
+  await D.patch('orders', o.id, {
+    pay_status: 'paid',
+    rzp_payment: razorpay_payment_id
+  });
+
+  s.json({ ok: true, verified: true, status: 'captured' });
+}));
 app.get('/api/orders/track',limit(30,36e5),wrap(async(q,s)=>{const o=await D.get('orders',+q.query.id),ph=String(q.query.phone||'').replace(/\D/g,'').slice(-10);
   if(!o||ph.length<10||o.phone.replace(/\D/g,'').slice(-10)!==ph)throw bad('No order found for those details',404);
   const{id,status,pay_status,total,items,created,method}=o;s.json({id,status,pay_status,total,items,created,method})}));
